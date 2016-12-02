@@ -1,0 +1,1037 @@
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Runtime.InteropServices;
+using PLM;
+
+namespace PLM
+{
+    internal static class PCI_8134A
+    {
+#if WIN64
+    public const string LibPath = "8134Ax64.dll";
+#else
+        public const string LibPath = "8134A.dll";
+#endif
+
+        public enum OnOffState : int
+        {
+            OFF = 0,
+            ON = 1,
+        }
+        [Flags]
+        public enum IO : uint
+        {
+            None = 0,
+            EL_P = 1 << 0,
+            EL_N = 1 << 1,
+            SD_P = 1 << 2,
+            SD_N = 1 << 3,
+            ORG = 1 << 4,
+            EZ = 1 << 5,
+            ALM = 1 << 6,
+            SVON = 1 << 7,
+            RDY = 1 << 8,
+            INT = 1 << 9,
+            ERC = 1 << 10,
+            INP = 1 << 11,
+        }
+        [Flags]
+        public enum IntFactor : uint
+        {
+            None = 0,
+            EL_Stop = 1 << 0,
+            SD_Stop = 1 << 1,
+            ALM_Stop = 1 << 2,
+            STP_Stop = 1 << 3,
+            // 4: Reserved
+            Home_Done = 1 << 5,
+            PTP_Done = 1 << 6,
+            Interpolation_Done = 1 << 7,
+            // 8-12: Reserved
+            Stop_Stop = 1 << 13,
+            Encoder_Error = 1 << 14,
+            STA_Start = 1 << 15,
+            Accel_Done = 1 << 16,
+            Decel_Start = 1 << 17,
+            // 18-22: Reserved
+            RDY_Active = 1 << 23,
+            // 24-31: Reserved
+        }
+        [Flags]
+        public enum IntStatus : uint
+        {
+            None = 0,
+            EL_P_Stop = 1 << 0,
+            EL_N_Stop = 1 << 1,
+            SD_P_Stop = 1 << 2,
+            SD_N_Stop = 1 << 3,
+            ALM_Stop = 1 << 4,
+            STP_Stop = 1 << 5,
+            // 6-7: Reserved
+            v_stop_Stop = 1 << 8,
+            Home_Done = 1 << 9,
+            // 10: Reserved
+            PTP_Done = 1 << 11,
+            EA_EB_Error = 1 << 12,
+            // 13: Reserved
+            PA_PB_Error = 1 << 14,
+            STA_Start = 1 << 15,
+            Accel_Done = 1 << 16,
+            Decel_Start = 1 << 17,
+            // 18-22: Reserved
+            RDY_Active = 1 << 23,
+            // 24-31: Reserved
+        }
+        public enum ErrorCode : int
+        {
+            err_NoError = 0,
+            err_NoExistCard = -600,
+            err_X_RDY = -601,
+            err_X_ALM = -602,
+            err_Y_RDY = -617,
+            err_Y_ALM = -618,
+            err_EMG_NO_Release = -621,
+            err_ALM_NO_Input = -622,
+            err_SD_NO_Input = -623,
+            err_HWDpSetting = -624,
+            err_ERC = -625,
+            err_OutputPulseSetting = -626,
+            err_InputPulseSetting = -627,
+        }
+        // Card initialization must be done in correct sequence, kept track by using the following state.
+        // The state indicates which step has NOT been processed.
+        public enum InitialState
+        {
+            B_8134A_initial = 0,
+            B_8134A_int_enable,
+            B_8134A_int_control,
+            B_8134A_set_int_factor,
+            B_8134A_link_axis_interrupt,
+            InitializationCompleted,
+        }
+        private static InitialState _CurrentInitialState = InitialState.B_8134A_initial;
+        public static InitialState CurrentInitialState
+        {
+            get
+            {
+                return _CurrentInitialState;
+            }
+        }
+        private static short _NumberOfCardsExist = 0;
+        public static short NumberOfCardsExist
+        {
+            get
+            {
+                return _NumberOfCardsExist;
+            }
+        }
+        private static IntPtr[] _InterruptEventHandle = new IntPtr[4] { IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero };
+        public static IntPtr[] InterruptEventHandle
+        {
+            get
+            {
+                return _InterruptEventHandle;
+            }
+        }
+        // Default Interrupt to be enabled are:
+        //  EL_Stop, ALM_Stop, STP_Stop, Home_Done, PTP_Done, Interpolation_Done, Stop_Stop, Encoder_Error, RDY_Active
+        private static uint _DefaultIntFactor = (uint)(
+
+          IntFactor.EL_Stop |
+          IntFactor.ALM_Stop |
+          IntFactor.STP_Stop |
+          IntFactor.Home_Done |
+          IntFactor.PTP_Done |
+          IntFactor.Interpolation_Done |
+          IntFactor.Stop_Stop |
+          IntFactor.Encoder_Error |
+          IntFactor.RDY_Active
+          );
+        public static uint DefaultIntFactor
+        {
+            get
+            {
+                return _DefaultIntFactor;
+            }
+        }
+        private static PCI_8134A.CallBackProcDelegate interruptCallbackDelegate_X = new PCI_8134A.CallBackProcDelegate(InterruptCallback_X);
+        private static PCI_8134A.CallBackProcDelegate interruptCallbackDelegate_Y = new PCI_8134A.CallBackProcDelegate(InterruptCallback_Y);
+        /// <summary>
+        /// 1. Initial card, check if the PCI_8134A card exists.
+        /// 2. Setup the required interrupt functions
+        /// PCI_8134A Initial must be done before XYBeam Initial!
+        /// </summary>
+        /// <returns></returns>
+        public static int Initial()
+        {
+            try
+            {
+                // B_8134A_initial
+                if (CurrentInitialState == InitialState.B_8134A_initial)
+                {
+                    short ret = PCI_8134A.B_8134A_initial(ref _NumberOfCardsExist);
+                    if (ret != (int)ErrorCode.err_NoError)
+                    {
+                        return (int)ErrorCode.err_NoExistCard;
+                    }
+                    else if (NumberOfCardsExist <= 0)
+                    {
+                        return (int)ErrorCode.err_NoExistCard;
+                    }
+                    else
+                    {
+                        _CurrentInitialState = InitialState.B_8134A_int_enable;
+                    }
+                }
+                // B_8134A_int_enable
+                if (CurrentInitialState == InitialState.B_8134A_int_enable)
+                {
+                    // Warning: Only Card 0's interrupt will be enabled here!
+                    short ret = PCI_8134A.B_8134A_int_enable(0, ref _InterruptEventHandle[0]);
+                    if (ret != (int)ErrorCode.err_NoError)
+                    {
+                        return (int)ErrorCode.err_HWDpSetting;
+                    }
+                    else
+                    {
+                        _CurrentInitialState = InitialState.B_8134A_int_control;
+                    }
+                }
+                // B_8134A_int_control
+                if (CurrentInitialState == InitialState.B_8134A_int_control)
+                {
+                    short ret = PCI_8134A.B_8134A_int_control(0, 1);
+                    if (ret != (int)ErrorCode.err_NoError)
+                    {
+                        return (int)ErrorCode.err_HWDpSetting;
+                    }
+                    else
+                    {
+                        _CurrentInitialState = InitialState.B_8134A_set_int_factor;
+                    }
+                }
+                // B_8134A_set_int_factor
+                if (CurrentInitialState == InitialState.B_8134A_set_int_factor)
+                {
+                    short ret = PCI_8134A.B_8134A_set_int_factor(0, DefaultIntFactor);
+                    if (ret != (int)ErrorCode.err_NoError)
+                    {
+                        return (int)ErrorCode.err_HWDpSetting;
+                    }
+                    ret = PCI_8134A.B_8134A_set_int_factor(1, DefaultIntFactor);
+                    if (ret != (int)ErrorCode.err_NoError)
+                    {
+                        return (int)ErrorCode.err_HWDpSetting;
+                    }
+                    else
+                    {
+                        _CurrentInitialState = InitialState.B_8134A_link_axis_interrupt;
+                    }
+                }
+                // B_8134A_link_axis_interrupt
+                if (CurrentInitialState == InitialState.B_8134A_link_axis_interrupt)
+                {
+                    // Warning: Only Card 0's interrupt will be enabled here!
+                    short ret = PCI_8134A.B_8134A_link_axis_interrupt(0, interruptCallbackDelegate_X);
+                    if (ret != (int)ErrorCode.err_NoError)
+                    {
+                        return (int)ErrorCode.err_HWDpSetting;
+                    }
+                    ret = PCI_8134A.B_8134A_link_axis_interrupt(1, interruptCallbackDelegate_Y);
+                    if (ret != (int)ErrorCode.err_NoError)
+                    {
+                        return (int)ErrorCode.err_HWDpSetting;
+                    }
+                    else
+                    {
+                        _CurrentInitialState = InitialState.InitializationCompleted;
+                    }
+                }
+                // Check for the completion state
+                if (CurrentInitialState == InitialState.InitializationCompleted)
+                {
+                    return (int)ErrorCode.err_NoError;
+                }
+                else
+                {
+                    return (int)ErrorCode.err_HWDpSetting;
+                }
+            }
+            catch (Exception)
+            {
+                // Warning: Log for the Exception code!
+                return (int)ErrorCode.err_HWDpSetting;
+            }
+        }
+        /// <summary>
+        /// When interrupt happens, this function will be called.
+        /// Call get_int_status to understand which interrupt happens.
+        /// Then, call the event handlers accordingly.
+        /// </summary>
+        /// <param name="IntAxisNo"></param>
+        private static void InterruptCallback_X()
+        {
+            uint intStatus = 0;
+            // Axis 0 (X-Axis)
+            PCI_8134A.B_8134A_get_int_status(0, ref intStatus);
+            // Invoke event handlers
+            if ((intStatus & (int)IntStatus.ALM_Stop) > 0)
+            {
+                if (CTRL.MOVEPATTERN == "move_Abs_X")
+                { 
+                
+                }
+
+                else if (CTRL.MOVEPATTERN == "move_Rlt_X")
+                {
+
+                }
+
+                else if (CTRL.MOVEPATTERN == "move_Rlt_X")
+                {
+
+                }
+
+            }
+            if ((intStatus & (int)IntStatus.EL_N_Stop) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.EL_P_Stop) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.Home_Done) > 0)
+            {
+                if (XYBeam.flag_OrgX == true)
+                {
+                    PLM.CTRL.In_OrgPst_X();
+                    XYBeam.flag_OrgX = false;
+                }
+            }
+            if ((intStatus & (int)IntStatus.EA_EB_Error) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.PA_PB_Error) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.PTP_Done) > 0)
+            {
+                if (CTRL.MOVEPATTERN == "move_Abs_X")
+                {
+                    CTRL.In_AbsPst_X();
+                }
+
+                else if (CTRL.MOVEPATTERN == "move_Rlt_X")
+                {
+                    CTRL.In_RltPst_X();
+                }
+                    /*
+                else if (CTRL.MOVEPATTERN == "move_Abs_XY")
+                {
+                    CTRL.In_AbsPst_XY();
+                }
+
+                else if (CTRL.MOVEPATTERN == "move_Rlt_XY")
+                {
+                    CTRL.In_RltPst_XY();
+                }
+                 */
+
+            }
+
+            if ((intStatus & (int)IntStatus.RDY_Active) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.STP_Stop) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.v_stop_Stop) > 0)
+            {
+            }
+        }
+
+        private static void InterruptCallback_Y()
+        {
+            uint intStatus = 0;
+            PCI_8134A.B_8134A_get_int_status(1, ref intStatus);
+            // Invoke event handlers
+            if ((intStatus & (int)IntStatus.ALM_Stop) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.EL_N_Stop) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.EL_P_Stop) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.Home_Done) > 0)
+            {
+                if (XYBeam.flag_OrgY == true)
+                {
+                    PLM.CTRL.In_OrgPst_Y();
+                    XYBeam.flag_OrgY = false;
+                }
+            }
+            if ((intStatus & (int)IntStatus.EA_EB_Error) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.PA_PB_Error) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.PTP_Done) > 0)
+            {
+
+                if (CTRL.MOVEPATTERN == "move_Abs_Y")
+                {
+                    CTRL.In_AbsPst_Y();
+                }
+
+                else if (CTRL.MOVEPATTERN == "move_Rlt_Y")
+                {
+                    CTRL.In_RltPst_Y();
+                }
+                    /*
+                else if (CTRL.MOVEPATTERN == "move_Abs_XY")
+                {
+                    CTRL.In_AbsPst_XY();
+                }
+
+                else if (CTRL.MOVEPATTERN == "move_Rlt_XY")
+                {
+                    CTRL.In_RltPst_XY();
+                }
+                */
+            }
+            if ((intStatus & (int)IntStatus.RDY_Active) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.STP_Stop) > 0)
+            {
+            }
+            if ((intStatus & (int)IntStatus.v_stop_Stop) > 0)
+            {
+            }
+        }
+        /// <summary>
+        /// Turn the selected Servo ON: Set SVON output to 0.
+        /// </summary>
+        /// <param name="axis"></param>
+        /// <returns></returns>
+        public static int Servo_On(short axis)
+        {
+            try
+            {
+                // Check if card has been initialized
+                if (CurrentInitialState != InitialState.InitializationCompleted)
+                {
+                    return (int)ErrorCode.err_NoExistCard;
+                }
+                // Turn on by logic LOW, therefore set On_Off to 0.
+                short result = PCI_8134A.B_8134A_set_servo(axis, 0);
+                if (result != (int)ErrorCode.err_NoError)
+                {
+                    // Warning: Log the error code!
+                    return (int)ErrorCode.err_HWDpSetting;
+                }
+                else
+                {
+                    return (int)ErrorCode.err_NoError;
+                }
+            }
+            catch (Exception)
+            {
+                return (int)ErrorCode.err_HWDpSetting;
+            }
+        }
+        /// <summary>
+        /// Turn the selected Servo OFF: Set SVON output to 1.
+        /// </summary>
+        /// <param name="axis"></param>
+        /// <returns></returns>
+        public static int Servo_Off(short axis)
+        {
+            try
+            {
+                // Check if card has been initialized
+                if (CurrentInitialState != InitialState.InitializationCompleted)
+                {
+                    return (int)ErrorCode.err_NoExistCard;
+                }
+                // Turn off by logic HIGH, therefore set On_Off to 1.
+                short result = PCI_8134A.B_8134A_set_servo(axis, 1);
+                if (result != (int)ErrorCode.err_NoError)
+                {
+                    // Warning: Log the error code!
+                    return (int)ErrorCode.err_HWDpSetting;
+                }
+                else
+                {
+                    return (int)ErrorCode.err_NoError;
+                }
+            }
+            catch (Exception)
+            {
+                return (int)ErrorCode.err_HWDpSetting;
+            }
+        }
+        /// <summary>
+        /// Check if the selected axis' Alarm pin active. Check if ALM pin equals 1: Alarm.
+        /// </summary>
+        /// <param name="axis"></param>
+        /// <returns></returns>
+        public static bool IsIOAlarm(short axis)
+        {
+            // Call the IsIOStatusEqual to check IO.ALM equals true
+            try
+            {
+                return IsIOStatusEqual(axis, IO.ALM, (int)IO.ALM);
+            }
+            catch (Exception)
+            {
+                // In error case, return that axis is Alarm state.
+                return true;
+            }
+        }
+        /// <summary>
+        /// Check if the selected axis' Ready pin active. Check if RDY pin equals 0: Ready.
+        /// </summary>
+        /// <param name="axis"></param>
+        /// <returns></returns>
+        public static bool IsIOReady(short axis)
+        {
+            // Call the IsIOStatusEqual to check IO.RDY equals 0
+            try
+            {
+                return IsIOStatusEqual(axis, IO.RDY, 0);
+            }
+            catch (Exception)
+            {
+                // In error case, return that axis is NOT ready.
+                return false;
+            }
+        }
+        /// <summary>
+        /// Compare that the selected axis' IO status equals given value.
+        /// Warning: Caller function MUST handle exception!.
+        /// Sample codes:
+        /// IsIOStatusEqual(axis, IO.RDY, 0); // Checks if IO.RDY pin is 0.
+        /// IsIOStatusEqual(axis, IO.RDY, (int)IO.RDY); // Checks if IO.RDY pin is 1.
+        /// IsIOStatusEqual(axis, IO.EL_P | IO.EL_N, 0); // Checks if both IO.EL_P and IO.EL_N pins are 0.
+        /// IsIOStatusEqual(axis, IO.EL_P | IO.EL_N, (int)(IO.EL_P | IO.EL_N)); // Checks if both IO.EL_P and IO.EL_N pins are 1.
+        /// IsIOStatusEqual(axis, IO.EL_P | IO.EL_N, (int)IO.EL_P); // Checks if IO.EL_P = 1 and IO.EL_N pin = 0.
+        /// </summary>
+        /// <param name="axis"></param>
+        /// <param name="io"></param>
+        /// <param name="value"></param>
+        /// <returns></returns>
+        public static bool IsIOStatusEqual(short axis, IO io, int value)
+        {
+            // Check if card has been initialized
+            if (CurrentInitialState != InitialState.InitializationCompleted)
+            {
+                // Must throw exception here, to prevent further processing of the io status.
+                // In case of IO failure. The calling function must handle the exception.
+                throw new InvalidOperationException();
+            }
+            short io_status = 0;
+            short ret = PCI_8134A.B_8134A_get_io_status(axis, ref io_status);
+            if (ret != (int)ErrorCode.err_NoError)
+            {
+                // Throw exception here
+                throw new Exception(string.Format("PCI_8134A Error while processing get_io_status: {0}:{1}", (short)ret, ret.ToString()));
+            }
+            else
+            {
+                // Check if the io pin and value are equal
+                return (io_status & (int)io) == value;
+            }
+        }
+
+        public static int CS_8134A_motion_done(short axis)
+        {
+            int ret = PCI_8134A.B_8134A_motion_done(axis);
+            return ret;
+        }
+
+        public static void CS_8134A_close()
+        {
+            // TODO.
+        }
+        /// <summary>
+        /// Return the IO_status values.
+        /// </summary>
+        /// <param name="axis"></param>
+        /// <returns></returns>
+        public static uint chkIOstatus(short axis)
+        {
+
+            // Check if card has been initialized
+            if (CurrentInitialState != InitialState.InitializationCompleted)
+            {
+                // Must throw exception here, to prevent further processing of the io status.
+                // In case of IO failure. The calling function must handle the exception.
+                throw new InvalidOperationException();
+            }
+            short io_status = 0;
+            short ret = PCI_8134A.B_8134A_get_io_status(axis, ref io_status);
+            if (ret != (int)ErrorCode.err_NoError)
+            {
+                // Throw exception here
+                throw new Exception(string.Format("PCI_8134A Error while processing get_io_status: {0}:{1}", (short)ret, ret.ToString()));
+            }
+            else
+            {
+                // Check if the io pin and value are equal
+                return (uint)io_status;
+            }
+        }
+
+        public static double GetCurrPst(short AxisNo)
+        { 
+            double ret = 0.00;
+            PCI_8134A.B_8134A_get_position(AxisNo, ref ret);
+            return ret;
+        }
+
+        #region DLL Import
+
+
+        public struct sAxisArray4
+        {
+            public short AxisArray1;
+            public short AxisArray2;
+            public short AxisArray3;
+            public short AxisArray4;
+        }
+
+        public struct sDistA4
+        {
+            public double DistA1;
+            public double DistA2;
+            public double DistA3;
+            public double DistA4;
+        }
+
+        public struct sMaxVelA4
+        {
+            public double MaxVelA1;
+            public double MaxVelA2;
+            public double MaxVelA3;
+            public double MaxVelA4;
+        }
+
+        public struct sPosA4
+        {
+            public double PosA1;
+            public double PosA2;
+            public double PosA3;
+            public double PosA4;
+        }
+
+        public struct sStrVelA4
+        {
+            public double StrVelA1;
+            public double StrVelA2;
+            public double StrVelA3;
+            public double StrVelA4;
+        }
+
+        public struct sSVaccA4
+        {
+            public double SVaccA1;
+            public double SVaccA2;
+            public double SVaccA3;
+            public double SVaccA4;
+        }
+
+        public struct sSVdecA4
+        {
+            public double SVdecA1;
+            public double SVdecA2;
+            public double SVdecA3;
+            public double SVdecA4;
+        }
+
+        public struct sTaccA4
+        {
+            public double TaccA1;
+            public double TaccA2;
+            public double TaccA3;
+            public double TaccA4;
+        }
+
+        public struct sTdecA4
+        {
+            public double TdecA1;
+            public double TdecA2;
+            public double TdecA3;
+            public double TdecA4;
+        }
+
+        [DllImport(LibPath, EntryPoint = "_8134_initial", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_initial(ref short existCards);
+
+        [DllImport(LibPath, EntryPoint = "_8134_int_control", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_int_control(short CardNo, int intFlag);
+
+        [DllImport(LibPath, EntryPoint = "_8134_int_enable", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_int_enable(short CardNo, ref IntPtr phEvent);
+
+        [DllImport(LibPath, EntryPoint = "_8134_int_disable", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_int_disable(short CardNo);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="AxisNo"></param>
+        /// <param name="int_status">
+        /// BIT:
+        ///  0: Stop with the +EL Signal
+        ///  1: Stop with the -EL Signal
+        ///  2: Stop with the +SD Signal
+        ///  3: Stop with the -SD Signal
+        ///  4: Stop with the ALM Signal
+        ///  5: Stop with the STP Signal
+        ///  6: Always 0
+        ///  7: Always 0
+        ///  8: Stop with v_stop() command
+        ///  9: Stop with home return command
+        /// 10: Always 0
+        /// 11: Stop with preset move completed (PTP Move)
+        /// 12: Stop with EA/EB input error
+        /// 13: Always 0
+        /// 14: Stop with PA/PB input error
+        /// 15: Start with STA Signal
+        /// 16: Acceleration Completed
+        /// 17: Deceleration Started
+        /// 18-22: Always 0
+        /// 23: RDY Active (AP3 of PCL5023 change from 1 to 0)
+        /// 24-31: Always 0
+        /// </param>
+        /// <returns></returns>
+        [DllImport(LibPath, EntryPoint = "_8134_get_int_status", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_get_int_status(short AxisNo, ref uint int_status);
+
+        [DllImport(LibPath, EntryPoint = "_8134_link_axis_interrupt", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_link_axis_interrupt(short AxisNo, PCI_8134A.CallBackProcDelegate lpCallBackProc);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="AxisNo"></param>
+        /// <param name="int_factor">
+        /// BIT:
+        ///  0: Stop with the EL signal
+        ///  1: Stop with the SD signal
+        ///  2: Stop with the ALM Signal
+        ///  3: Stop with the STP signal
+        ///  4: Should be set to 0
+        ///  5: Completion of home return
+        ///  6: Completion of preset movement (PTP move)
+        ///  7: Completion of interpolating motion for 2 axes: (X & Y) or (Z & U)
+        ///  8-12: Should be set to 0
+        /// 13: When stop function stop the axis
+        /// 14: EA/EB, PA/PB encoder input error
+        /// 15: Start with STA signal
+        /// 16: Completion of acceleration
+        /// 17: Start of deceleration
+        /// 18-22: Should be set to 0
+        /// 23: RDY active (AP3 of PCL5023 change from 1 to 0)
+        /// 24-31: Should be set to 0
+        /// </param>
+        /// <returns></returns>
+        [DllImport(LibPath, EntryPoint = "_8134_set_int_factor", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_int_factor(short AxisNo, uint int_factor);
+
+        [DllImport(LibPath, EntryPoint = "_8134_close", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_close();
+
+        [DllImport(LibPath, EntryPoint = "_8134_get_irq_channel", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_get_irq_channel(short CardNo, ref short irq_no);
+
+        [DllImport(LibPath, EntryPoint = "_8134_get_base_addr", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_get_base_addr(short CardNo, ref short base_addr);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="AxisNo"></param>
+        /// <param name="io_status">
+        /// I/O Status Word where 1 is ON and 0 is OFF. Bit-word:
+        ///  0: +EL
+        ///  1: -EL
+        ///  2: +SD
+        ///  3: -SD
+        ///  4: ORG
+        ///  5: EZ
+        ///  6: ALM
+        ///  7: SVON
+        ///  8: RDY
+        ///  9: INT
+        /// 10: ERC
+        /// 11: INP
+        /// </param>
+        /// <returns></returns>
+        [DllImport(LibPath, EntryPoint = "_8134_get_io_status", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_get_io_status(short AxisNo, ref short io_status);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="AxisNo"></param>
+        /// <returns>
+        /// Return the motion status of PCI-8134
+        /// 0: Motion Stop
+        /// 1: Waiting STA
+        /// 2: Waiting INP
+        /// 3: In Accelerating
+        /// 4: In Target Speed
+        /// 5: In Decelerating
+        /// 6: In Start Speed
+        /// 7: Waiting other axes
+        /// </returns>
+        [DllImport(LibPath, EntryPoint = "_8134_motion_done", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern int B_8134A_motion_done(short AxisNo);
+
+        [DllImport(LibPath, EntryPoint = "_8134_get_position", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_get_position(short AxisNo, ref double Pos);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_position", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_position(short AxisNo, double Pos);
+
+        [DllImport(LibPath, EntryPoint = "_8134_get_command", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_get_command(short AxisNo, ref double CMD);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_command", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_command(short AxisNo, double CMD);
+
+        [DllImport(LibPath, EntryPoint = "_8134_get_error_counter", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_get_error_counter(short AxisNo, ref short error_counter);
+
+        [DllImport(LibPath, EntryPoint = "_8134_reset_error_counter", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_reset_error_counter(short AxisNo);
+
+        [DllImport(LibPath, EntryPoint = "_8134_get_current_speed", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_get_current_speed(short AxisNo, ref double Speed);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_rdp_move", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_rdp_move(short AxisNo, short rdp_mode);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_servo", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_servo(short AxisNo, short On_Off);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="AxisNo"></param>
+        /// <param name="pls_outmode">
+        /// Setting of command pulse output mode for OUT and DIR pins.
+        /// 0: OUT/DIR type pulse output
+        /// 1: CW/CCW type pulse output
+        /// </param>
+        /// <returns></returns>
+        [DllImport(LibPath, EntryPoint = "_8134_set_pls_outmode", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_pls_outmode(short AxisNo, short pls_outmode);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="AxisNo"></param>
+        /// <param name="pls_iptmode">
+        /// Setting of Encoder feedback pulse input mode for EA and EB pins.
+        /// 0: 1x AB phase type pulse input
+        /// 1: 2x AB phase type pulse input
+        /// 2: 4x AB phase type pulse input
+        /// 3: CW/CCW type pulse input
+        /// </param>
+        /// <returns></returns>
+        [DllImport(LibPath, EntryPoint = "_8134_set_pls_iptmode", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_pls_iptmode(short AxisNo, short pls_iptmode);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="AxisNo"></param>
+        /// <param name="Src">
+        /// Feedback Counter source
+        /// 0: Counter source from command pulse
+        /// 1: Counter source from external input EA, EB
+        /// </param>
+        /// <returns></returns>
+        [DllImport(LibPath, EntryPoint = "_8134_set_feedback_src", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_feedback_src(short AxisNo, short Src);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_move_ratio", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_move_ratio(short AxisNo, double ratio);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_alm", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_alm(short AxisNo, short alm_logic, short alm_mode);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_inp", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_inp(short AxisNo, short inp_enable, short inp_logic);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_erc_enable", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_erc_enable(short AxisNo, short erc_enable);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_sd", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_sd(short AxisNo, short enable, short sd_logic, short sd_latch, short sd_mode);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_home_config", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_home_config(short AxisNo, short home_mode, short org_logic, short ez_logic, short ez_count, short erc_out);
+
+        [DllImport(LibPath, EntryPoint = "_8134_home_move", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_home_move(short AxisNo, double StrVel, double MaxVel, double Tacc);
+
+        [DllImport(LibPath, EntryPoint = "_8134_pulser_v_move", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_pulser_v_move(short AxisNo, double SpeedLimit);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="AxisNo"></param>
+        /// <param name="InputMode">
+        /// Setting of manual pulser input mode from PA and PB pins
+        /// 0: 1x AB phase type pulse input
+        /// 1: 2x AB phase type pulse input
+        /// 2: 4x AB phase type pulse input
+        /// 3: CW/CCW type pulse input
+        /// </param>
+        /// <param name="Indep_com">
+        /// Common or independent mode selection
+        /// 0: Independent for each axis
+        /// 1: PAX, PBX common for PAY, PBY; or PAZ, PBZ common for PAU, PBU
+        /// </param>
+        /// <returns></returns>
+        [DllImport(LibPath, EntryPoint = "_8134_set_pulser_iptmode", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_pulser_iptmode(short AxisNo, short InputMode, short Indep_com);
+
+        [DllImport(LibPath, EntryPoint = "_8134_tv_move", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_tv_move(short AxisNo, double StrVel, double MaxVel, double Tacc);
+
+        [DllImport(LibPath, EntryPoint = "_8134_sv_move", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_sv_move(short AxisNo, double StrVel, double MaxVel, double Tacc, double SVacc);
+
+        [DllImport(LibPath, EntryPoint = "_8134_emg_stop", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_emg_stop(short AxisNo);
+
+        [DllImport(LibPath, EntryPoint = "_8134_sd_stop", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_sd_stop(short AxisNo, double Tdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_v_change", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_v_change(short AxisNo, double NewVel, double TimeSecond);
+
+        [DllImport(LibPath, EntryPoint = "_8134_fix_speed_range", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_fix_speed_range(short AxisNo, double MaxVel);
+
+        [DllImport(LibPath, EntryPoint = "_8134_unfix_speed_range", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_unfix_speed_range(short AxisNo);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_tr_move", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_tr_move(short AxisNo, double Dist, double StrVel, double MaxVel, double Tacc, double Tdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_ta_move", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_ta_move(short AxisNo, double Pos, double StrVel, double MaxVel, double Tacc, double Tdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_sr_move", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_sr_move(short AxisNo, double Dist, double StrVel, double MaxVel, double Tacc, double Tdec, double SVacc, double SVdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_sa_move", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_sa_move(short AxisNo, double Pos, double StrVel, double MaxVel, double Tacc, double Tdec, double SVacc, double SVdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_tr_move_xy", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_tr_move_xy(short CardNo, double DistX, double DistY, double StrVel, double MaxVel, double Tacc, double Tdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_ta_move_xy", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_ta_move_xy(short CardNo, double PosX, double PosY, double StrVel, double MaxVel, double Tacc, double Tdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_sr_move_xy", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_sr_move_xy(short CardNo, double DistX, double DistY, double StrVel, double MaxVel, double Tacc, double Tdec, double SVacc, double SVdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_sa_move_xy", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_sa_move_xy(short CardNo, double PosX, double PosY, double StrVel, double MaxVel, double Tacc, double Tdec, double SVacc, double SVdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_tr_move_zu", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_tr_move_zu(short CardNo, double DistX, double DistY, double StrVel, double MaxVel, double Tacc, double Tdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_ta_move_zu", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_ta_move_zu(short CardNo, double PosX, double PosY, double StrVel, double MaxVel, double Tacc, double Tdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_sr_move_zu", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_sr_move_zu(short CardNo, double DistX, double DistY, double StrVel, double MaxVel, double Tacc, double Tdec, double SVacc, double SVdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_sa_move_zu", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_sa_move_zu(short CardNo, double PosX, double PosY, double StrVel, double MaxVel, double Tacc, double Tdec, double SVacc, double SVdec);
+
+        [DllImport(LibPath, EntryPoint = "_8134_start_move_all", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_start_move_all(short FirstAxisNo);
+
+        [DllImport(LibPath, EntryPoint = "_8134_stop_move_all", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_stop_move_all(short FirstAxisNo);
+
+        [DllImport(LibPath, EntryPoint = "_8134_config_from_file", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_config_from_file([MarshalAs(UnmanagedType.VBByRefStr)] ref string file_name);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_tr_move_all", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_tr_move_all(short TotalAxes, ref sAxisArray4 AxisArray, ref sDistA4 DistA, ref sStrVelA4 StrVelA, ref sMaxVelA4 MaxVelA, ref sTaccA4 TaccA, ref sTdecA4 TdecA);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_sa_move_all", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_sa_move_all(short TotalAx, ref sAxisArray4 AxisArray, ref sPosA4 PosA, ref sStrVelA4 StrVelA, ref sMaxVelA4 MaxVelA, ref sTaccA4 TaccA, ref sTdecA4 TdecA, ref sSVaccA4 SVaccA, ref sSVdecA4 SVdecA);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_ta_move_all", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_ta_move_all(short TotalAx, ref sAxisArray4 AxisArray, ref sPosA4 PosA, ref sStrVelA4 StrVelA, ref sMaxVelA4 MaxVelA, ref sTaccA4 TaccA, ref sTdecA4 TdecA);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_sr_move_all", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_sr_move_all(short TotalAx, ref sAxisArray4 AxisArray, ref sDistA4 DistA, ref sStrVelA4 StrVelA, ref sMaxVelA4 MaxVelA, ref sTaccA4 TaccA, ref sTdecA4 TdecA, ref sSVaccA4 SVaccA, ref sSVdecA4 SVdecA);
+
+        [DllImport(LibPath, EntryPoint = "_8134_verify_speed", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern double B_8134A_verify_speed(double StrVel, double MaxVel, ref double minAccT, ref double maxAccT, double MaxSpeed);
+
+        [DllImport(LibPath, EntryPoint = "_8134_version_info", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_version_info(short CardNo, ref short HardwareInfo, ref int SoftwareInfo, ref int DriverInfo);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="CardNo"></param>
+        /// <param name="org_latch">
+        /// Latch state control for ORG signal
+        /// 0: Don't latch input
+        /// 1: Latch input
+        /// </param>
+        /// <returns></returns>
+        [DllImport(LibPath, EntryPoint = "_8134_set_org_offset", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_org_offset(short CardNo, short org_latch);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="CardNo"></param>
+        /// <param name="org_logic">
+        /// Action logic configuration for ORG signal
+        /// 0: Active low
+        /// 1: Active High
+        /// </param>
+        /// <returns></returns>
+        [DllImport(LibPath, EntryPoint = "_8134_set_org_logic", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_org_logic(short CardNo, short org_logic);
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="CardNo"></param>
+        /// <param name="b_value">Times of I/O checking.</param>
+        /// <returns></returns>
+        [DllImport(LibPath, EntryPoint = "_8134_set_bounce_filter", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_bounce_filter(short CardNo, short b_value);
+
+        [DllImport(LibPath, EntryPoint = "_8134_set_feedback_error_detect", CharSet = CharSet.Ansi, SetLastError = true)]
+        public static extern short B_8134A_set_feedback_error_detect(short axis, int max_error);
+
+        public delegate void CallBackProcDelegate();
+        #endregion
+    }
+}
